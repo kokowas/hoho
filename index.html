@@ -475,15 +475,17 @@
     }
     function deactivateListenMode() { if (listen_audioPlayer && !listen_audioPlayer.paused) listen_audioPlayer.pause(); listen_playPauseButton.textContent = "▶️"; listen_playPauseButton.classList.remove('btn-pulsing'); listenModeUI.style.display = 'none'; listen_playPauseButton.onclick = null; listen_audioPlayer.ontimeupdate = null; listen_audioPlayer.onended = null; listen_audioPlayer.onplay = null; listen_audioPlayer.onseeked = null; listen_audioPlayer.onpause = null; readerSelect.onchange = null; if (Array.isArray(listen_words)) listen_words.forEach(word => {word.onclick = null; word.style.visibility='hidden';}); const prerollTitleDisp = sentenceContainerShared.querySelector('.preroll-title-display'); if(prerollTitleDisp) prerollTitleDisp.style.visibility = 'hidden'; currentReaderDataForListen = null; }
 
+    // --- READ MODE SCRIPT ---
     const read_speechButton = document.getElementById("speechButtonRead");
     const read_speechStatus = document.getElementById("speechStatusRead");
     const read_resetButton = document.getElementById("resetButtonRead");
     let read_currentWordIndex = 0, read_isRecognizing = false;
-    let read_finalTranscriptBuffer = ""; // Buffer for final results
-    let read_processingTimeout = null; // Timeout for processing the buffer
-    const PROCESSING_DELAY = 750; // Milliseconds to wait for more speech before processing
+    let read_finalTranscriptBuffer = ""; 
+    let read_processingTimeout = null; 
+    const PROCESSING_DELAY = 750; // Milliseconds to wait for more speech
 
     let read_shouldRestart = false, read_restartTimeout, read_silenceTimeout, read_recognition;
+    let read_userRequestedStop = false; // Flag for user-initiated stop vs engine stop
 
     function read_normalizeText(text) { 
         if (!text) return ""; 
@@ -557,12 +559,14 @@
                 if (nextSkipBtn) { nextSkipBtn.style.visibility = 'hidden'; } 
             }
              if (read_isRecognizing) { 
-                read_recognition.stop(); // Will trigger onend, which handles restart
+                read_userRequestedStop = false; // This stop is to reset for next word, allow auto-restart
+                read_recognition.stop(); 
             }
         } else { // All words completed, last one by skipping
             read_speechStatus.textContent = "🎉 أحسنت! لقد أكملت النص (مع بعض التجاوزات). 🎉"; 
             triggerConfettiEffect(); 
-            read_shouldRestart = false; // Ensure it doesn't try to restart
+            read_shouldRestart = false; 
+            read_userRequestedStop = true; // Task is complete, this is a definitive stop
             if (read_isRecognizing) {
                  read_recognition.stop();
             } else {
@@ -627,9 +631,12 @@
                 }
                 triggerConfettiEffect();
                 read_shouldRestart = false;
+                read_userRequestedStop = true; // Task complete, definitive stop
                 read_speechButton.classList.remove('btn-pulsing');
-                if (read_isRecognizing) { // If completed during active recognition (not via onend from stop button)
-                    read_recognition.stop(); // This will trigger onend, which will call updateUIForStopped
+                if (read_isRecognizing) { 
+                    read_recognition.stop(); 
+                } else {
+                     read_updateUIForStopped();
                 }
             }
         }
@@ -643,6 +650,7 @@
         read_recognition.lang = 'fr-FR'; 
         
         read_recognition.onstart = () => { 
+            console.log("SR.onstart triggered");
             read_isRecognizing = true; 
             read_finalTranscriptBuffer = ""; // Clear buffer at start
             read_speechButton.textContent = "🔴 جاري القراءة..."; 
@@ -657,39 +665,69 @@
             read_processingTimeout = null;
         };
 
-        read_recognition.onend = () => { 
-            read_isRecognizing = false; // Set this first
-            if (read_restartTimeout) clearTimeout(read_restartTimeout); 
-            if (read_silenceTimeout) clearTimeout(read_silenceTimeout); 
-            read_restartTimeout = null; 
-            read_silenceTimeout = null; 
+        read_recognition.onend = () => {
+            console.log("SR.onend called. read_isRecognizing (before update):", read_isRecognizing, "read_userRequestedStop:", read_userRequestedStop, "read_shouldRestart:", read_shouldRestart, "Buffer:", read_finalTranscriptBuffer);
+            read_isRecognizing = false; // Set this first, crucial for restart logic
 
+            if (read_restartTimeout) clearTimeout(read_restartTimeout);
+            read_restartTimeout = null;
+            if (read_silenceTimeout) clearTimeout(read_silenceTimeout);
+            read_silenceTimeout = null;
+
+            // Process any pending or accumulated final transcript
             if (read_processingTimeout) { // If a processing timeout was pending
                 clearTimeout(read_processingTimeout);
                 read_processingTimeout = null;
-                // Process immediately what was buffered
                 if (read_finalTranscriptBuffer.trim() !== "") {
+                    console.log("SR.onend: Processing buffered transcript (was timeout pending):", read_finalTranscriptBuffer);
                     processFinalTranscript(read_finalTranscriptBuffer);
                 }
             } else if (read_finalTranscriptBuffer.trim() !== "") {
-                 // If no timeout was pending, but buffer has content (e.g. quick stop)
+                 // If no timeout was pending, but buffer has content (e.g. quick stop, or mobile engine stopped)
+                 console.log("SR.onend: Processing buffered transcript (no timeout pending):", read_finalTranscriptBuffer);
                  processFinalTranscript(read_finalTranscriptBuffer);
             }
             read_finalTranscriptBuffer = ""; // Always clear buffer after handling onend
 
-            if (read_shouldRestart && read_currentWordIndex < read_wordSpans.length) { 
-                read_restartTimeout = setTimeout(() => { 
-                    if (!read_isRecognizing && read_shouldRestart && read_currentWordIndex < read_wordSpans.length) { 
-                        try { read_recognition.start(); } 
-                        catch (e) { read_shouldRestart = false; read_updateUIForStopped(); } 
-                    } 
-                }, 100); 
-            } else { 
-                read_updateUIForStopped(); 
-            } 
+
+            if (read_userRequestedStop) { // User explicitly stopped or text completed
+                console.log("SR.onend: User requested stop or task completed. Updating UI.");
+                read_updateUIForStopped();
+                // read_userRequestedStop = false; // Reset for next interaction cycle - moved to toggle/reset
+            } else if (read_shouldRestart && read_currentWordIndex < read_wordSpans.length) {
+                // This condition means recognition ended, but it wasn't a user stop, and there's more to read.
+                // Likely an engine-driven stop (e.g., mobile, no-speech).
+                console.log("SR.onend: Engine likely stopped mid-stream. Attempting auto-restart.");
+                read_restartTimeout = setTimeout(() => {
+                    // Re-check conditions as state might have changed during the timeout (e.g., user clicked stop)
+                    if (read_shouldRestart && read_currentWordIndex < read_wordSpans.length && !read_userRequestedStop && !read_isRecognizing) { 
+                        try {
+                            console.log("SR.onend: Executing delayed auto-restart (50ms).");
+                            read_recognition.start();
+                        } catch (e) {
+                            console.error("SR.onend: Auto-restart failed:", e);
+                            read_shouldRestart = false; // Prevent loop if start keeps failing
+                            read_updateUIForStopped();
+                        }
+                    } else if (read_userRequestedStop) {
+                         console.log("SR.onend: User requested stop during restart delay. Aborting restart.");
+                         read_updateUIForStopped();
+                         // read_userRequestedStop = false; // Reset for next cycle - moved to toggle/reset
+                    } else {
+                         console.log("SR.onend: Conditions for auto-restart no longer met post-delay. (isRecog:", read_isRecognizing, "shouldRest:", read_shouldRestart, "userStop:", read_userRequestedStop,")");
+                         read_updateUIForStopped();
+                    }
+                }, 50); // Very short delay for auto-restart
+            } else {
+                // Recognition ended, not a user stop, but no restart needed (e.g., text already complete, or shouldRestart became false)
+                console.log("SR.onend: No user stop, no restart needed. Updating UI.");
+                read_updateUIForStopped();
+            }
         };
 
+
         function read_updateUIForStopped() { 
+            console.log("SR.read_updateUIForStopped called. Current word index:", read_currentWordIndex);
             read_speechButton.textContent = "🎤 ابدأ القراءة"; 
             read_speechButton.classList.remove('listening'); 
             if (read_currentWordIndex < read_wordSpans.length) { 
@@ -706,17 +744,20 @@
         }
 
         read_recognition.onerror = (event) => { 
+            console.error("SR.onerror:", event.error, "Message:", event.message);
             let errorMsg = "خطأ في التعرف: " + event.error; 
-            if (event.error === 'aborted' && read_shouldRestart) return; 
-            if (event.error === 'no-speech' && read_shouldRestart && read_currentWordIndex < read_wordSpans.length) { 
-                // No-speech can trigger onend, which will handle restart.
-                // Avoid showing error if it's just a natural pause leading to no-speech.
+            
+            // If it's an 'aborted' error and we were expecting a restart (not user-initiated), onend will handle the restart.
+            // 'no-speech' also typically triggers onend, which should handle the restart logic.
+            if ((event.error === 'aborted' || event.error === 'no-speech') && read_shouldRestart && !read_userRequestedStop) {
+                console.log(`SR.onerror: ${event.error}, but shouldRestart is true and not user stop. Letting onend handle.`);
+                // onend will be called shortly after these errors, which has the restart logic.
+                // We don't want to update UI to "stopped" if an auto-restart is imminent.
                 return; 
             } 
-            // For other errors, or if not expecting a restart
+            
             read_speechStatus.textContent = errorMsg; 
             read_isRecognizing = false; // Ensure state is correct
-            // Clear timeouts and buffer as an error likely means current attempt is over
             if (read_processingTimeout) clearTimeout(read_processingTimeout);
             read_processingTimeout = null;
             read_finalTranscriptBuffer = "";
@@ -728,10 +769,11 @@
             read_silenceTimeout = null; 
             
             let interimTranscript = ''; 
+            let newFinalTranscriptPart = ''; // Collect only the new final parts from this event
             for (let i = event.resultIndex; i < event.results.length; ++i) { 
                 const transcriptPart = event.results[i][0].transcript; 
                 if (event.results[i].isFinal) {
-                    read_finalTranscriptBuffer += transcriptPart + " "; 
+                    newFinalTranscriptPart += transcriptPart + " "; 
                 } else {
                     interimTranscript += transcriptPart;
                 }
@@ -746,17 +788,24 @@
                 }, 3000); 
             } 
             
-            if (read_finalTranscriptBuffer.trim() !== "" && read_isRecognizing) {
-                if (read_processingTimeout) clearTimeout(read_processingTimeout);
-                read_processingTimeout = setTimeout(() => {
-                    const transcriptToProcessNow = read_finalTranscriptBuffer;
-                    read_finalTranscriptBuffer = ""; // Clear buffer for next accumulation
-                    
-                    if (read_isRecognizing) { // Process only if still in recognizing state
-                        processFinalTranscript(transcriptToProcessNow);
-                    }
-                    read_processingTimeout = null; // Mark as processed/timeout completed
-                }, PROCESSING_DELAY);
+            if (newFinalTranscriptPart.trim() !== "") {
+                read_finalTranscriptBuffer += newFinalTranscriptPart; // Append new final parts to buffer
+                 console.log("SR.onresult: Got final part. Buffer now:", read_finalTranscriptBuffer.trim());
+                if (read_isRecognizing) { // Only set/reset timeout if still actively recognizing
+                    if (read_processingTimeout) clearTimeout(read_processingTimeout);
+                    read_processingTimeout = setTimeout(() => {
+                        const transcriptToProcessNow = read_finalTranscriptBuffer;
+                        read_finalTranscriptBuffer = ""; // Clear buffer for next accumulation
+                        
+                        if (read_isRecognizing) { // Double check, as recognition might have stopped during the delay
+                            console.log("SR.onresult: PROCESSING_DELAY timeout. Processing:", transcriptToProcessNow.trim());
+                            processFinalTranscript(transcriptToProcessNow);
+                        } else {
+                            console.log("SR.onresult: PROCESSING_DELAY timeout, but no longer recognizing. Discarding.");
+                        }
+                        read_processingTimeout = null; // Mark as processed/timeout completed
+                    }, PROCESSING_DELAY);
+                }
             }
         };
     }
@@ -764,17 +813,21 @@
     function read_toggleSpeechRecognition() { 
         if (!SpeechRecognitionAPI) return; 
         if (read_isRecognizing || read_shouldRestart) { // User wants to stop
-            read_shouldRestart = false; 
+            console.log("SR.toggle: User stopping recognition.");
+            read_userRequestedStop = true; // This is a user-initiated stop
+            read_shouldRestart = false; // Prevent any auto-restarts
+            
             if (read_restartTimeout) clearTimeout(read_restartTimeout); 
             if (read_silenceTimeout) clearTimeout(read_silenceTimeout); 
             read_restartTimeout = null; 
             read_silenceTimeout = null; 
             
-            if (read_processingTimeout) { // If a timeout is pending
+            if (read_processingTimeout) { // If a processing timeout is pending
                 clearTimeout(read_processingTimeout);
                 read_processingTimeout = null;
                 // Process any buffered content immediately before stopping
                 if (read_finalTranscriptBuffer.trim() !== "") {
+                     console.log("SR.toggle (stop): Processing final buffer before stopping:", read_finalTranscriptBuffer.trim());
                      processFinalTranscript(read_finalTranscriptBuffer);
                 }
             }
@@ -787,6 +840,8 @@
                 read_updateUIForStopped();
             }
         } else { // User wants to start
+            console.log("SR.toggle: User starting recognition.");
+            read_userRequestedStop = false; // Reset for this new session
             if (read_currentWordIndex >= read_wordSpans.length) read_resetActivity(); 
             read_shouldRestart = true; 
             read_speechButton.classList.remove('btn-pulsing');
@@ -803,6 +858,7 @@
                 } 
                 read_recognition.start(); 
             } catch (e) { 
+                console.error("SR.toggle (start): Error starting recognition:", e);
                 read_shouldRestart = false; 
                 read_isRecognizing = false; // Ensure this is false if start fails
                 read_updateUIForStopped(); 
@@ -810,28 +866,23 @@
         } 
     }
     function read_resetActivity() { 
+        console.log("SR.resetActivity called.");
+        read_userRequestedStop = true; // Treat reset as a user-initiated stop sequence
         read_currentWordIndex = 0; 
-        read_finalTranscriptBuffer = ""; // Clear the buffer
-        read_shouldRestart = false; 
+        read_finalTranscriptBuffer = ""; 
+        read_shouldRestart = false; // Reset should not auto-restart immediately
         read_skippedWords = []; 
         read_updateSkippedWordsDisplay(); 
 
         if (read_restartTimeout) clearTimeout(read_restartTimeout); 
         if (read_silenceTimeout) clearTimeout(read_silenceTimeout); 
-        if (read_processingTimeout) clearTimeout(read_processingTimeout); // Clear processing timeout
+        if (read_processingTimeout) clearTimeout(read_processingTimeout); 
         read_restartTimeout = null; 
         read_silenceTimeout = null; 
         read_processingTimeout = null;
         
         resetAllWordStyles(); 
 
-        read_wordSpans.forEach(span => {
-            span.style.visibility = 'visible';
-        });
-        
-        const prerollTitleDisp = sentenceContainerShared.querySelector('.preroll-title-display');
-        if(prerollTitleDisp) prerollTitleDisp.style.visibility = 'visible';
-        
         if (read_wordSpans.length > 0) { 
             const firstWord = read_wordSpans[0]; 
             if (firstWord) { 
@@ -848,6 +899,8 @@
         } else {
              read_updateUIForStopped();
         }
+         // After stopping or if already stopped, ensure userRequestedStop is false for the next cycle unless button is pressed again
+        setTimeout(() => { read_userRequestedStop = false; }, 50); // Small delay to allow onend to process with current flag
     }
     function initReadMode() { 
         readModeUI.style.display = 'block'; 
@@ -857,7 +910,6 @@
         read_updateSkippedWordsDisplay(); 
         
         if (SCRIPT_READERS_DATA.length > 0) {
-            // Assuming only one reader for read mode, or using the first one
             generateSentenceSpans(SCRIPT_READERS_DATA[0]); 
             read_wordSpans = Array.from(sentenceContainerShared.querySelectorAll('.word-container > .word-span')); 
         } else { 
@@ -866,14 +918,10 @@
         } 
 
         if (!SpeechRecognitionAPI) { 
-            read_speechButton.disabled = true; 
-            read_speechButton.textContent = "غير مدعوم"; 
-            read_resetButton.disabled = true; 
-            read_speechStatus.textContent = "التعرف الصوتي غير مدعوم."; 
-            return; 
-        } else { 
-            read_speechButton.disabled = false; 
-            read_resetButton.disabled = false; 
+            read_speechButton.disabled = true; read_speechButton.textContent = "غير مدعوم"; 
+            read_resetButton.disabled = true; read_speechStatus.textContent = "التعرف الصوتي غير مدعوم."; return; 
+        }  else { 
+            read_speechButton.disabled = false; read_resetButton.disabled = false; 
         } 
         
         read_wordSpans.forEach(span => { 
@@ -885,8 +933,10 @@
         read_resetButton.onclick = read_resetActivity; 
     }
     function deactivateReadMode() { 
+        console.log("SR.deactivateReadMode called.");
         if (SpeechRecognitionAPI && read_recognition && (read_isRecognizing || read_shouldRestart)) { 
-            read_shouldRestart = false; // Prevent restart attempts after deactivation
+            read_userRequestedStop = true; // Ensure it stops cleanly
+            read_shouldRestart = false; 
             if (read_isRecognizing) {
                 read_recognition.stop(); 
             }
@@ -897,16 +947,16 @@
         read_restartTimeout = null; 
         read_silenceTimeout = null; 
         read_processingTimeout = null;
-        read_finalTranscriptBuffer = ""; // Clear buffer
+        read_finalTranscriptBuffer = "";
 
         readModeUI.style.display = 'none'; 
         skippedWordsDisplay.style.display = 'none'; 
         sentenceContainerShared.classList.remove('read-mode-active');
         const allTextSpans = sentenceContainerShared.querySelectorAll('.word-container > .word-span, .preroll-title-display');
         allTextSpans.forEach(span => span.style.visibility = 'hidden');
-        read_speechButton.onclick = null; 
-        read_resetButton.onclick = null; 
+        read_speechButton.onclick = null; read_resetButton.onclick = null; 
         read_speechButton.classList.remove('btn-pulsing'); 
+        setTimeout(() => { read_userRequestedStop = false; }, 50); // Reset after deactivation
     }
 
     function switchToMode(mode) { 
@@ -934,7 +984,7 @@
     btnSelectRead.addEventListener('click', () => switchToMode('read'));
     
     if (SCRIPT_READERS_DATA && SCRIPT_READERS_DATA.length > 0) {
-        switchToMode('listen'); // Default to listen mode if data exists
+        switchToMode('listen'); 
     } else {
         sentenceContainerShared.innerHTML = '<p style="text-align:center; color:white;">لا توجد بيانات قارئ متاحة.</p>'; 
         sentenceContainerShared.style.display = 'block';
